@@ -130,5 +130,6 @@ _Not filled in yet._
 _To be added._
 
 ## Notes
+- The raw "May 2026" file contains some trips with wrong dates (for example 2009). `linear_models.py` drops every trip whose pickup is outside May 2026 (`--all-dates` turns this off). Any notebook that uses this file should do the same, so all models are scored on the same trips.
 - The quick 100,000-trip sample covers only about a day and a half (the file is ordered by time), so those numbers are only for checking that the code works. Use the whole file for results we report.
 - One month of data cannot tell us about other seasons.

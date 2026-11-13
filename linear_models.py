@@ -42,6 +42,7 @@ import numpy as np
 import pandas as pd
 import sklearn
 from sklearn.base import clone
+from sklearn.exceptions import ConvergenceWarning
 from sklearn.compose import ColumnTransformer
 from sklearn.dummy import DummyRegressor
 from sklearn.linear_model import Lasso, LinearRegression, LogisticRegression, Ridge
@@ -76,6 +77,10 @@ RUN_LOGISTIC = True             # set False (or pass --no-logistic) to skip logi
 RANDOM_STATE = 42
 CV_FOLDS = 5
 CV_MAX_ROWS = 50_000            # K-fold CV is run on at most this many training rows (speed)
+
+# The "May 2026" file also contains trips with wrong dates (some from 2009). Keep only real May 2026 pickups.
+MONTH_START, MONTH_END = "2026-05-01", "2026-06-01"   # end is exclusive
+LASSO_MAX_ITER, LASSO_TOL = 300, 1e-3                  # bounded work so Lasso can never run for hours
 
 TARGET = "fare_amount"
 ZONE_COLS = ["PULocationID", "DOLocationID"]
@@ -123,11 +128,13 @@ def load_data(path: str, sample_rows: int = DEFAULT_SAMPLE_ROWS) -> pd.DataFrame
     return pd.concat(chunks, ignore_index=True).head(sample_rows)
 
 
-def clean_data(df: pd.DataFrame, card_only: bool = False) -> pd.DataFrame:
+def clean_data(df: pd.DataFrame, card_only: bool = False, month_only: bool = True) -> pd.DataFrame:
     """Keep plausible completed trips. Rules are copied from Sean's notebook so the rows match.
 
     card_only=True additionally keeps payment_type == 1 (credit card) and passenger_count > 0,
     which is what the project outline says. It is OFF by default to match Sean's rows.
+    month_only=True (default) drops trips whose pickup time is outside May 2026 (the raw file has
+    some trips dated 2009 and other wrong years).
     """
     data = df.copy()
     for c in ["tpep_pickup_datetime", "tpep_dropoff_datetime"]:
@@ -149,6 +156,10 @@ def clean_data(df: pd.DataFrame, card_only: bool = False) -> pd.DataFrame:
     )
     if card_only:
         valid &= (data["payment_type"] == 1) & (data["passenger_count"] > 0)
+    if month_only:
+        in_month = data["tpep_pickup_datetime"].ge(MONTH_START) & data["tpep_pickup_datetime"].lt(MONTH_END)
+        print(f"Trips with pickup outside May 2026 (wrong dates): {int((~in_month).sum()):,} (removed)")
+        valid &= in_month
     clean = data.loc[valid].copy()
     print(f"Rows before cleaning: {len(data):,} | after: {len(clean):,} | excluded: {len(data) - len(clean):,}")
     if len(clean) < 100:
@@ -201,7 +212,7 @@ def make_regressor(kind: str, alpha: float = 1.0) -> Pipeline:
     model = {
         "Linear": LinearRegression(),
         "Ridge (L2)": Ridge(alpha=alpha),
-        "Lasso (L1)": Lasso(alpha=alpha, max_iter=5000),
+        "Lasso (L1)": Lasso(alpha=alpha, max_iter=LASSO_MAX_ITER, tol=LASSO_TOL),
     }[kind]
     return Pipeline([("prep", None), ("model", model)])  # prep filled in by caller
 
@@ -261,7 +272,7 @@ def _classification_metrics(y_true, y_hat, score) -> dict:
 # --------------------------------------------------------------------------------------
 REG_ALPHAS = {
     "Ridge (L2)": [0.01, 0.1, 1, 10, 100],
-    "Lasso (L1)": [0.00001, 0.0001, 0.001, 0.01, 0.1],
+    "Lasso (L1)": [0.0001, 0.001, 0.01, 0.1],
 }
 LOGIT_CS = [0.01, 0.1, 1, 10, 100]
 
@@ -281,12 +292,16 @@ def tune_regressor(kind: str, approach: str, train, valid) -> tuple[float, Pipel
     best_alpha, best_mae = None, np.inf
     for alpha in REG_ALPHAS[kind]:
         pipe = build_pipeline(approach, make_regressor(kind, alpha).named_steps["model"])
-        pipe.fit(small[feats], small[TARGET])
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", ConvergenceWarning)
+            pipe.fit(small[feats], small[TARGET])
         mae = mean_absolute_error(valid[TARGET], pipe.predict(valid[feats]))
         if mae < best_mae:
             best_alpha, best_mae = alpha, mae
     best_pipe = build_pipeline(approach, make_regressor(kind, best_alpha).named_steps["model"])
-    best_pipe.fit(train[feats], train[TARGET])
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", ConvergenceWarning)
+        best_pipe.fit(train[feats], train[TARGET])
     return best_alpha, best_pipe
 
 
@@ -296,10 +311,12 @@ def cv_mae(kind: str, approach: str, alpha: float, train) -> float:
     sub = train if len(train) <= CV_MAX_ROWS else train.sample(CV_MAX_ROWS, random_state=RANDOM_STATE)
     est = make_regressor(kind, alpha).named_steps["model"]
     pipe = build_pipeline(approach, est)
-    scores = cross_val_score(
-        pipe, sub[feats], sub[TARGET],
-        cv=KFold(CV_FOLDS, shuffle=True, random_state=RANDOM_STATE),
-        scoring="neg_mean_absolute_error", n_jobs=1)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", ConvergenceWarning)
+        scores = cross_val_score(
+            pipe, sub[feats], sub[TARGET],
+            cv=KFold(CV_FOLDS, shuffle=True, random_state=RANDOM_STATE),
+            scoring="neg_mean_absolute_error", n_jobs=1)
     return float(-scores.mean())
 
 
@@ -571,6 +588,8 @@ def main(argv=None):
     ap.add_argument("--cutoff", type=float, default=FARE_CUTOFF, help="dollar cutoff for the yes/no label")
     ap.add_argument("--no-logistic", action="store_true", help="skip logistic regression")
     ap.add_argument("--card-only", action="store_true", help="keep only card payments and passenger_count > 0")
+    ap.add_argument("--all-dates", action="store_true",
+                    help="do not drop trips dated outside May 2026 (not recommended)")
     ap.add_argument("--download", action="store_true", help="download the parquet file if it is missing")
     ap.add_argument("--synthetic", action="store_true", help="use fake demo data instead of the real file")
     ap.add_argument("--out", default="results", help="folder for result tables and plots")
@@ -597,7 +616,7 @@ def main(argv=None):
                          "Put the parquet file there, or re-run with --download, or use --synthetic.")
         raw = load_data(args.data, args.sample)
 
-    clean = clean_data(raw, card_only=args.card_only)
+    clean = clean_data(raw, card_only=args.card_only, month_only=not args.all_dates)
     reg_df, log_df, _ = run_experiment(clean, args.cutoff, not args.no_logistic, args.out)
 
     pd.set_option("display.width", 200, "display.max_columns", 20)
