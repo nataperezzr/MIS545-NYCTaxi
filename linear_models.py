@@ -19,9 +19,10 @@ What this file does
 
 Quick start
 -----------
-    python linear_models.py --data data/yellow_tripdata_2026-05.parquet --sample 100000
-    python linear_models.py --data data/yellow_tripdata_2026-05.parquet --sample 0     # full file
-    python linear_models.py --synthetic                                               # demo, no data needed
+    python linear_models.py --download            # whole month (default); downloads the file if missing
+    python linear_models.py --update-readme       # whole month, then fills the README results table
+    python linear_models.py --quick               # first 100,000 trips only, about a minute (code check)
+    python linear_models.py --synthetic           # fake demo data, no file needed
 
 Other people's models can be put on the same $35 scale with threshold_metrics():
     from linear_models import threshold_metrics
@@ -63,7 +64,13 @@ from sklearn.preprocessing import OneHotEncoder, StandardScaler
 # --------------------------------------------------------------------------------------
 DEFAULT_DATA = "data/yellow_tripdata_2026-05.parquet"
 DATA_URL = "https://d37ci6vzurychx.cloudfront.net/trip-data/yellow_tripdata_2026-05.parquet"
-DEFAULT_SAMPLE_ROWS = 100_000   # 0 means "use the whole file"
+DEFAULT_SAMPLE_ROWS = 0         # 0 = whole file (default). --quick uses QUICK_SAMPLE_ROWS instead
+QUICK_SAMPLE_ROWS = 100_000     # first N trips; they cover only about a day, so only for code checks
+TUNE_MAX_ROWS = 200_000         # alpha / C are chosen on at most this many training trips, then the
+                                # winner is refit on ALL training trips (keeps the full month fast)
+# Only these columns are read from the parquet file (saves a lot of memory on 4M rows)
+LOAD_COLUMNS = ["tpep_pickup_datetime", "tpep_dropoff_datetime", "passenger_count", "trip_distance",
+                "PULocationID", "DOLocationID", "payment_type", "fare_amount"]
 FARE_CUTOFF = 35.0              # dollars; used for the yes/no label
 RUN_LOGISTIC = True             # set False (or pass --no-logistic) to skip logistic regression
 RANDOM_STATE = 42
@@ -104,10 +111,11 @@ def load_data(path: str, sample_rows: int = DEFAULT_SAMPLE_ROWS) -> pd.DataFrame
 
     pf = pq.ParquetFile(path)
     print(f"Total rows in file: {pf.metadata.num_rows:,}")
+    cols = [c for c in LOAD_COLUMNS if c in pf.schema_arrow.names]
     if not sample_rows:
-        return pd.read_parquet(path)
+        return pd.read_parquet(path, columns=cols)
     chunks, read = [], 0
-    for batch in pf.iter_batches(batch_size=min(sample_rows, 100_000)):
+    for batch in pf.iter_batches(batch_size=min(sample_rows, 100_000), columns=cols):
         chunks.append(batch.to_pandas())
         read += len(chunks[-1])
         if read >= sample_rows:
@@ -173,7 +181,7 @@ def chronological_split(df: pd.DataFrame):
     if span_days < 7:
         warnings.warn(
             f"These trips cover only about {span_days + 1} day(s). Results will not represent a full "
-            "month. Use --sample 0 for the whole file.", stacklevel=2)
+            "month. Run without --quick to use the whole file.", stacklevel=2)
     return train, valid, test
 
 
@@ -253,21 +261,32 @@ def _classification_metrics(y_true, y_hat, score) -> dict:
 # --------------------------------------------------------------------------------------
 REG_ALPHAS = {
     "Ridge (L2)": [0.01, 0.1, 1, 10, 100],
-    "Lasso (L1)": [0.0001, 0.001, 0.01, 0.1],
+    "Lasso (L1)": [0.00001, 0.0001, 0.001, 0.01, 0.1],
 }
-LOGIT_CS = [0.01, 0.1, 1, 10]
+LOGIT_CS = [0.01, 0.1, 1, 10, 100]
+
+
+def _tuning_slice(train: pd.DataFrame) -> pd.DataFrame:
+    """A random slice of the training trips used to choose alpha / C quickly."""
+    if len(train) <= TUNE_MAX_ROWS:
+        return train
+    return train.sample(TUNE_MAX_ROWS, random_state=RANDOM_STATE)
 
 
 def tune_regressor(kind: str, approach: str, train, valid) -> tuple[float, Pipeline]:
-    """Pick alpha with validation MAE only (the test set is never used for tuning)."""
+    """Pick alpha with validation MAE only (the test set is never used for tuning).
+    Alphas are compared on a slice of the training trips, then the winner is refit on all of them."""
     feats = FEATURE_SETS[approach]
-    best_alpha, best_mae, best_pipe = None, np.inf, None
+    small = _tuning_slice(train)
+    best_alpha, best_mae = None, np.inf
     for alpha in REG_ALPHAS[kind]:
         pipe = build_pipeline(approach, make_regressor(kind, alpha).named_steps["model"])
-        pipe.fit(train[feats], train[TARGET])
+        pipe.fit(small[feats], small[TARGET])
         mae = mean_absolute_error(valid[TARGET], pipe.predict(valid[feats]))
         if mae < best_mae:
-            best_alpha, best_mae, best_pipe = alpha, mae, pipe
+            best_alpha, best_mae = alpha, mae
+    best_pipe = build_pipeline(approach, make_regressor(kind, best_alpha).named_steps["model"])
+    best_pipe.fit(train[feats], train[TARGET])
     return best_alpha, best_pipe
 
 
@@ -430,21 +449,26 @@ def run_logistic_models(train, valid, test, cutoff, out: Path) -> pd.DataFrame:
     yte = (test[TARGET] >= cutoff).astype(int)
     if ytr.sum() < 20 or yte.sum() < 5:
         print(f"WARNING: too few trips at ${cutoff:.0f}+ (train={int(ytr.sum())}, test={int(yte.sum())}). "
-              "Skipping logistic regression. Use more data (--sample 0) or a lower --cutoff.")
+              "Skipping logistic regression. Use more data (run without --quick) or a lower --cutoff.")
         return pd.DataFrame()
     rows = []
+    small = _tuning_slice(train)
+    ysm = (small[TARGET] >= cutoff).astype(int)
     for approach, feats in FEATURE_SETS.items():
         for kind in ["L1", "L2"]:
-            best = (-np.inf, None, None)
-            for C in LOGIT_CS:  # choose C by validation average precision (good for rare classes)
-                pipe = build_pipeline(approach, make_logistic(kind, C))
+            best_ap, C = -np.inf, None
+            for c in LOGIT_CS:  # choose C by validation average precision (good for rare classes)
+                cand = build_pipeline(approach, make_logistic(kind, c))
                 with warnings.catch_warnings():
                     warnings.simplefilter("ignore")
-                    pipe.fit(train[feats], ytr)
-                ap = average_precision_score(yva, pipe.predict_proba(valid[feats])[:, 1])
-                if ap > best[0]:
-                    best = (ap, C, pipe)
-            _, C, pipe = best
+                    cand.fit(small[feats], ysm)
+                ap = average_precision_score(yva, cand.predict_proba(valid[feats])[:, 1])
+                if ap > best_ap:
+                    best_ap, C = ap, c
+            pipe = build_pipeline(approach, make_logistic(kind, C))
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                pipe.fit(train[feats], ytr)
             proba = pipe.predict_proba(test[feats])[:, 1]
             hat = (proba >= 0.5).astype(int)
             rows.append({"Model": f"Logistic ({kind})", "Approach": approach, "Best C": C,
@@ -540,7 +564,10 @@ def update_readme(reg_df, log_df, clean, sample_rows, cutoff, readme="README.md"
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Linear and logistic models for NYC Yellow Taxi fares")
     ap.add_argument("--data", default=DEFAULT_DATA, help="path to yellow_tripdata_2026-05.parquet")
-    ap.add_argument("--sample", type=int, default=DEFAULT_SAMPLE_ROWS, help="rows to use; 0 = whole file")
+    ap.add_argument("--sample", type=int, default=DEFAULT_SAMPLE_ROWS,
+                    help="rows to use; 0 = whole file (default)")
+    ap.add_argument("--quick", action="store_true",
+                    help=f"only the first {QUICK_SAMPLE_ROWS:,} trips (about a day; for checking the code)")
     ap.add_argument("--cutoff", type=float, default=FARE_CUTOFF, help="dollar cutoff for the yes/no label")
     ap.add_argument("--no-logistic", action="store_true", help="skip logistic regression")
     ap.add_argument("--card-only", action="store_true", help="keep only card payments and passenger_count > 0")
@@ -550,6 +577,8 @@ def main(argv=None):
     ap.add_argument("--update-readme", action="store_true",
                     help="write this run's result tables into README.md (not allowed with --synthetic)")
     args = ap.parse_args(argv)
+    if args.quick:
+        args.sample = QUICK_SAMPLE_ROWS
     if args.update_readme and args.synthetic:
         sys.exit("--update-readme is not allowed with --synthetic: fake results must not go in the README.")
 

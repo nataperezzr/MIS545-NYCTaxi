@@ -41,13 +41,18 @@ If it is not there, add `--download` when you run the script and it will fetch i
 
 3. Run it:
    ```
-   python linear_models.py --download --sample 100000
+   python linear_models.py --download
    ```
-   This downloads the data if needed and uses the first 100,000 trips so it runs in under a minute or two.
+   This downloads the data if needed and runs the **whole month** (about 4 million trips). It takes roughly 15 to 25 minutes and needs a few GB of memory.
 
-   For the whole month, use `--sample 0` (slower and needs more memory):
+   Just want to check that it works? Use the quick version (first 100,000 trips, about a minute):
    ```
-   python linear_models.py --sample 0
+   python linear_models.py --quick
+   ```
+
+   To run the whole month and also fill in the results table in this README:
+   ```
+   python linear_models.py --update-readme
    ```
 
 4. Look in the `results/` folder for the tables (`.csv`) and plots (`plots/`).
@@ -58,7 +63,8 @@ No data yet and just want to check that it works? Run `python linear_models.py -
 
 | Option | What it does |
 |---|---|
-| `--sample 100000` | Use the first 100,000 trips. `0` = whole file. |
+| `--quick` | Only the first 100,000 trips (about a day and a half). For checking the code. |
+| `--sample N` | Use the first N trips. `0` (the default) = whole file. |
 | `--cutoff 35` | Dollar cutoff for the yes/no ("fare is this much or more?") label. |
 | `--no-logistic` | Skip logistic regression. |
 | `--card-only` | Keep only card payments with at least 1 passenger. |
@@ -76,7 +82,7 @@ No data yet and just want to check that it works? Run `python linear_models.py -
 2. Run `jupyter notebook` and open `notebooks/linear/NYC_Yellow_Taxi_Linear_and_Logistic.ipynb`.
 3. Choose **Run all**.
 
-Settings (sample size, dollar cutoff, logistic on/off) are in the notebook's "Settings" cell.
+Settings (sample size, dollar cutoff, logistic on/off) are in the notebook's "Settings" cell. By default it runs the whole month, which takes a while; set `SAMPLE_ROWS = 100_000` there for a quick check.
 
 ## Comparing everyone's models on the same scale
 
@@ -90,7 +96,7 @@ threshold_metrics(y_test, predicted_fares, cutoff=35)   # precision, recall, F1,
 
 ## Results
 
-**Preliminary.** These come from the first 100,000 trips in the file, which are all from about the first day of May (May 1, early morning to evening, test period = that evening). They show that the code works, not how the models do on the whole month. We will replace them with full-month numbers.
+**Preliminary.** These come from the first 100,000 trips in the file, which cover only about a day and a half (Apr 30 evening to May 2 early morning; the test period is the evening of May 1). They show that the code works, not how the models do on the whole month. We will replace them with full-month numbers.
 
 Test-period MAE in dollars (lower is better):
 
@@ -110,9 +116,9 @@ Knowing the actual distance and duration (post-trip) cuts the error by about $2.
 
 ### Linear models (Apurbo)
 
-Not run on the real data yet. After running the script on the real file, this table fills itself in:
+Not run on the whole month yet. After running the script on the real file, this table fills itself in:
 ```
-python linear_models.py --sample 0 --update-readme
+python linear_models.py --update-readme
 ```
 
 <!-- LINEAR-RESULTS:START -->
@@ -124,5 +130,5 @@ _Not filled in yet._
 _To be added._
 
 ## Notes
-- The 100,000-trip sample covers less than one day (the file is ordered by time), so those numbers are only for checking that the code works. Use the whole file for results we report.
+- The quick 100,000-trip sample covers only about a day and a half (the file is ordered by time), so those numbers are only for checking that the code works. Use the whole file for results we report.
 - One month of data cannot tell us about other seasons.
